@@ -11,7 +11,12 @@ no warnings 'recursion';
 
 use namespace::clean -except => 'meta';
 
-with qw(KiokuDB::TypeMap::Entry::Std);
+with (
+    'KiokuDB::TypeMap::Entry::Std',
+    'KiokuDB::TypeMap::Entry::Std::Expand' => {
+        alias => { compile_expand => 'compile_expand_body' },
+    }
+);
 
 # FIXME collapser and expaner should both be methods in Class::MOP::Class,
 # apart from the visit call
@@ -139,28 +144,15 @@ sub compile_collapse_body {
 }
 
 sub compile_expand {
-    my ( $self, $class, $resolver ) = @_;
+    my ( $self, $class, $resolver, @args ) = @_;
 
     my $meta = Class::MOP::get_metaclass_by_name($class);
-
-    my ( %attrs, %lazy );
-
-    my @attrs = grep {
-        !$_->does('KiokuDB::Meta::Attribute::DoNotSerialize')
-            and
-        !$_->does('MooseX::Storage::Meta::Attribute::Trait::DoNotSerialize')
-    } $meta->get_all_attributes;
-
-    foreach my $attr ( @attrs ) {
-        $attrs{$attr->name} = $attr;
-        $lazy{$attr->name}  = $attr->does("KiokuDB::Meta::Attribute::Lazy");
-    }
-
-    my $meta_instance = $meta->get_meta_instance;
 
     my $typemap_entry = $self;
 
     my $anon = $meta->is_anon_class;
+
+    my $inner = $self->compile_expand_body($class, $resolver, @args);
 
     return sub {
         my ( $linker, $entry, @args ) = @_;
@@ -181,11 +173,51 @@ sub compile_expand {
             return $linker->$method($entry, @args);
         }
 
+        $linker->$inner($entry, @args);
+    }
+}
 
-        my $instance = $meta_instance->create_instance();
+sub compile_create {
+    my ( $self, $class ) = @_;
 
-        # note, this is registered *before* any other value expansion, to allow circular refs
-        $linker->register_object( $entry => $instance );
+    my $meta = Class::MOP::get_metaclass_by_name($class);
+
+    my $meta_instance = $meta->get_meta_instance;
+
+    return sub { $meta_instance->create_instance() };
+}
+
+sub compile_clear {
+    my ( $self, $class ) = @_;
+
+    return sub {
+        my ( $linker, $obj ) = @_;
+        %$obj = (); # FIXME
+    }
+}
+
+sub compile_expand_data {
+    my ( $self, $class, @args ) = @_;
+
+    my $meta = Class::MOP::get_metaclass_by_name($class);
+
+    my $meta_instance = $meta->get_meta_instance;
+
+    my ( %attrs, %lazy );
+
+    my @attrs = grep {
+        !$_->does('KiokuDB::Meta::Attribute::DoNotSerialize')
+            and
+        !$_->does('MooseX::Storage::Meta::Attribute::Trait::DoNotSerialize')
+    } $meta->get_all_attributes;
+
+    foreach my $attr ( @attrs ) {
+        $attrs{$attr->name} = $attr;
+        $lazy{$attr->name}  = $attr->does("KiokuDB::Meta::Attribute::Lazy");
+    }
+
+    return sub {
+        my ( $linker, $instance, $entry, @args ) = @_;
 
         my $data = $entry->data;
 
@@ -198,7 +230,7 @@ sub compile_expand {
             if ( ref $value ) {
                 if ( $lazy{$name} and ref($value) ) {
                     my $thunk = KiokuDB::Thunk->new( collapsed => $value, linker => $linker, attr => $attr );
-                    $meta_instance->set_slot_value($instance, $attr->name, $thunk); # FIXME low level variant of $attr->set_value
+                    $meta_instance->set_slot_value($instance, $attr->name, $thunk); # FIXME introduce low level variant of $attr->set_value to Class::MOP (no side effects)
                 } else {
                     my @pair = ( $attr, undef );
 
@@ -206,16 +238,18 @@ sub compile_expand {
                     push @values, \@pair;
                 }
             } else {
-                $attr->set_value($instance, $value);
+                $attr->set_value($instance, $value); # FIXME introduce low level variant of $attr->set_value to Class::MOP (no side effects)
             }
         }
 
-        $linker->queue_finalizer(sub {
-            foreach my $pair ( @values ) {
-                my ( $attr, $value ) = @$pair;
-                $attr->set_value($instance, $value);
-            }
-        });
+        if ( @values ) {
+            $linker->queue_finalizer(sub {
+                foreach my $pair ( @values ) {
+                    my ( $attr, $value ) = @$pair;
+                    $attr->set_value($instance, $value);
+                }
+            });
+        }
 
         return $instance;
     }
